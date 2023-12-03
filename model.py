@@ -4,8 +4,61 @@ import torch.nn.functional as F
 from math import sqrt
 from itertools import product as product
 import torchvision
+from models.gumbel_sigmoid import GumbelSigmoid
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class Separation(torch.nn.Module):
+    def __init__(self, size, num_channel=64, tau=0.1):
+        super(Separation, self).__init__()
+        C, H, W = size
+        self.C, self.H, self.W = C, H, W
+        self.tau = tau
+
+        self.sep_net = nn.Sequential(
+            nn.Conv2d(C, num_channel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(num_channel),
+            nn.ReLU(),
+            nn.Conv2d(num_channel, num_channel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(num_channel),
+            nn.ReLU(),
+            nn.Conv2d(num_channel, C, kernel_size=3, stride=1, padding=1, bias=False),
+        )
+
+    def forward(self, feat, is_eval=False):
+        mask = self.sep_net(feat)
+
+        mask = mask.reshape(mask.shape[0], 1, -1)
+        mask = torch.nn.Sigmoid()(mask)
+        mask = GumbelSigmoid(tau=self.tau)(mask, is_eval=is_eval)
+        mask = mask[:, 0].reshape(mask.shape[0], self.C, self.H, self.W)
+
+        r_feat = feat * mask
+        nr_feat = feat * (1 - mask)
+
+        return r_feat, nr_feat, mask
+
+class Recalibration(nn.Module):
+    def __init__(self, size, num_channel=64):
+        super(Recalibration, self).__init__()
+        C, H, W = size
+        self.rec_net = nn.Sequential(
+            nn.Conv2d(C, num_channel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(num_channel),
+            nn.ReLU(),
+            nn.Conv2d(num_channel, num_channel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(num_channel),
+            nn.ReLU(),
+            nn.Conv2d(num_channel, C, kernel_size=3, stride=1, padding=1, bias=False)
+        )
+
+    def forward(self, nr_feat, mask):
+        rec_units = self.rec_net(nr_feat)
+        rec_units = rec_units * (1 - mask)
+        rec_feat = nr_feat + rec_units
+
+        return rec_feat
 
 
 class VGGBase(nn.Module):
@@ -47,6 +100,11 @@ class VGGBase(nn.Module):
 
         # Load pretrained layers
         self.load_pretrained_layers()
+        self.tau = 0.1
+        self.seperation_conv4_3 = Separation(size = (512, 38, 38), num_channel=512)
+        self.seperation_conv7 = Separation(size= (1024, 19, 19), num_channel=1024)
+        self.recalibration_conv4_3 = Recalibration(size = (512, 38, 38), num_channel=512)
+        self.recalibration_conv7 = Recalibration(size= (1024, 19, 19), num_channel=1024)
 
     def forward(self, image):
         """
@@ -71,7 +129,13 @@ class VGGBase(nn.Module):
         out = F.relu(self.conv4_1(out))  # (N, 512, 38, 38)
         out = F.relu(self.conv4_2(out))  # (N, 512, 38, 38)
         out = F.relu(self.conv4_3(out))  # (N, 512, 38, 38)
-        conv4_3_feats = out  # (N, 512, 38, 38)
+        # conv4_3_feats = out  # (N, 512, 38, 38)
+
+        r_conv4_3_feats, nr_conv4_3_feats, mask4 = self.seperation_conv4_3(out)
+        rec_conv4_3_feats = self.recalibration_conv4_3(nr_conv4_3_feats, mask4)
+        
+        feat4_3 = r_conv4_3_feats + rec_conv4_3_feats
+        
         out = self.pool4(out)  # (N, 512, 19, 19)
 
         out = F.relu(self.conv5_1(out))  # (N, 512, 19, 19)
@@ -82,9 +146,20 @@ class VGGBase(nn.Module):
         out = F.relu(self.conv6(out))  # (N, 1024, 19, 19)
 
         conv7_feats = F.relu(self.conv7(out))  # (N, 1024, 19, 19)
-
+        r_conv7_feats, nr_conv7_feats, mask7 = self.seperation_conv7(conv7_feats)
+        rec_conv7_feats = self.recalibration_conv7(nr_conv7_feats, mask7)
+        
+        feat7 = r_conv7_feats + rec_conv7_feats
+        
         # Lower-level feature maps
-        return conv4_3_feats, conv7_feats
+        # ----------- #
+        # adv: feat4_3, feat7
+        # robust feature: r_conv4_3_feats, r_conv7_feats
+        # nonrobust feature: nr_conv4_3_feats, nr_conv7_feats
+        # recalibration feature: rec_conv4_3_feats, rec_conv7_feats
+        # ----------- #
+
+        return feat4_3, feat7, r_conv4_3_feats, r_conv7_feats, nr_conv4_3_feats, nr_conv7_feats, rec_conv4_3_feats, rec_conv7_feats
 
     def load_pretrained_layers(self):
         """
@@ -350,8 +425,9 @@ class SSD300(nn.Module):
         :return: 8732 locations and class scores (i.e. w.r.t each prior box) for each image
         """
         # Run VGG base network convolutions (lower level feature map generators)
-        conv4_3_feats, conv7_feats = self.base(image)  # (N, 512, 38, 38), (N, 1024, 19, 19)
-
+        # conv4_3_feats, conv7_feats = self.base(image)  # (N, 512, 38, 38), (N, 1024, 19, 19)
+        conv4_3_feats, conv7_feats, r_conv4_3_feats, r_conv7_feats, nr_conv4_3_feats, nr_conv7_feats, rec_conv4_3_feats, rec_conv7_feats = self.base(image)
+        
         # Rescale conv4_3 after L2 norm
         norm = conv4_3_feats.pow(2).sum(dim=1, keepdim=True).sqrt()  # (N, 1, 38, 38)
         conv4_3_feats = conv4_3_feats / norm  # (N, 512, 38, 38)
@@ -366,7 +442,14 @@ class SSD300(nn.Module):
         locs, classes_scores = self.pred_convs(conv4_3_feats, conv7_feats, conv8_2_feats, conv9_2_feats, conv10_2_feats,
                                                conv11_2_feats)  # (N, 8732, 4), (N, 8732, n_classes)
 
-        return locs, classes_scores
+        # ROBUST
+        r_locs, r_classes_scores = self.pred_convs(r_conv4_3_feats, r_conv7_feats, conv8_2_feats, conv9_2_feats, conv10_2_feats, conv11_2_feats)
+        # NON_ROBUST
+        nr_locs, nr_classes_scores = self.pred_convs(nr_conv4_3_feats, nr_conv7_feats, conv8_2_feats, conv9_2_feats, conv10_2_feats, conv11_2_feats)
+        # RECALIBRATION
+        rec_locs, rec_classes_scores = self.pred_convs(rec_conv4_3_feats, rec_conv7_feats, conv8_2_feats, conv9_2_feats, conv10_2_feats, conv11_2_feats)
+
+        return locs, classes_scores, r_locs, r_classes_scores, nr_locs, nr_classes_scores, rec_locs, rec_classes_scores
 
     def create_prior_boxes(self):
         """
