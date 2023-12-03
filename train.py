@@ -5,6 +5,7 @@ import torch.utils.data
 from model import SSD300, MultiBoxLoss
 from datasets import PascalVOCDataset
 from utils import *
+from attacks.pgd import PGD
 
 # Data parameters
 data_folder = './'  # folder with data files
@@ -62,6 +63,9 @@ def main():
 
     # Move to default device
     model = model.to(device)
+    eps = 8
+    alpha = 0.25
+    attack = PGD(model, eps/255.0, alpha * (eps/255.0), min_val=0, max_val=1, max_iters=10, _type='linf')
     criterion = MultiBoxLoss(priors_cxcy=model.priors_cxcy).to(device)
 
     # Custom dataloaders
@@ -88,6 +92,7 @@ def main():
         # One epoch's training
         train(train_loader=train_loader,
               model=model,
+              attack=attack,
               criterion=criterion,
               optimizer=optimizer,
               epoch=epoch)
@@ -96,7 +101,7 @@ def main():
         save_checkpoint(epoch, model, optimizer)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, attack, criterion, optimizer, epoch):
     """
     One epoch's training.
 
@@ -106,13 +111,17 @@ def train(train_loader, model, criterion, optimizer, epoch):
     :param optimizer: optimizer
     :param epoch: epoch number
     """
-    model.train()  # training mode enables dropout
+     # training mode enables dropout
 
     batch_time = AverageMeter()  # forward prop. + back prop. time
     data_time = AverageMeter()  # data loading time
     losses = AverageMeter()  # loss
 
     start = time.time()
+
+    adv_losses = 0
+    sep_losses = 0
+    rec_losses = 0
 
     # Batches
     for i, (images, boxes, labels, _) in enumerate(train_loader):
@@ -123,11 +132,22 @@ def train(train_loader, model, criterion, optimizer, epoch):
         boxes = [b.to(device) for b in boxes]
         labels = [l.to(device) for l in labels]
 
+        model.eval()
+        adv_images = attack.perturb(images, boxes, labels, True)
+        model.train() 
+        
         # Forward prop.
-        predicted_locs, predicted_scores = model(images)  # (N, 8732, 4), (N, 8732, n_classes)
-
+        # locs: (N, 8732, 4), scores: (N, 8732, n_classes)
+        adv_predicted_locs, adv_predicted_scores, r_predicted_locs, r_predicted_scores, nr_predicted_locs, nr_predicted_scores, rec_predcited_locs, rec_predcited_scores = model(adv_images) 
+        
         # Loss
-        loss = criterion(predicted_locs, predicted_scores, boxes, labels)  # scalar
+        adv_losses = criterion(adv_predicted_locs, adv_predicted_scores, boxes, labels)  # scalar
+        r_losses = criterion(r_predicted_locs, r_predicted_scores, boxes, labels)
+        nr_losses = criterion(nr_predicted_locs, nr_predicted_scores, boxes, labels)
+        sep_losses = r_losses + nr_losses
+        rec_losses = criterion(rec_predcited_locs, rec_predcited_scores, boxes, labels)
+        loss = adv_losses + sep_losses + rec_losses
+        
 
         # Backward prop.
         optimizer.zero_grad()
@@ -147,13 +167,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # Print status
         if i % print_freq == 0:
+            print(adv_losses, r_losses, nr_losses, rec_losses)
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Batch Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data Time {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(epoch, i, len(train_loader),
                                                                   batch_time=batch_time,
                                                                   data_time=data_time, loss=losses))
-    del predicted_locs, predicted_scores, images, boxes, labels  # free some memory since their histories may be stored
+    del adv_predicted_locs, adv_predicted_scores, images, boxes, labels  # free some memory since their histories may be stored
 
 
 if __name__ == '__main__':
