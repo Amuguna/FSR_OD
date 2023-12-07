@@ -6,6 +6,9 @@ CAS : https://github.com/bymavis/CAS_ICLR2021
 
 import torch
 import torch.nn as nn
+from model import MultiBoxLoss
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def project(x, original_x, epsilon, _type='linf'):
@@ -31,9 +34,10 @@ class PGD():
         self.max_val = max_val
         self.max_iters = max_iters
         self._type = _type
-
-    def perturb(self, original_images, labels, random_start=False):
-        device = original_images.get_device()
+        self.criterion = MultiBoxLoss(priors_cxcy=model.priors_cxcy).to(device)
+        
+    def perturb(self, original_images, bboxes, labels, random_start=False):
+        # device = original_images.get_device()
 
         if random_start:
             rand_perturb = torch.FloatTensor(original_images.shape).uniform_(
@@ -48,10 +52,11 @@ class PGD():
 
         with torch.enable_grad():
             for _iter in range(self.max_iters):
-                outputs, outputs_r, outputs_nr, outputs_rec = self.model(x, is_eval=True)
-                cls_loss = nn.CrossEntropyLoss()(outputs, labels)
+                #outputs, outputs_r, outputs_nr, outputs_rec = self.model(x, is_eval=True)
+                adv_locs, adv_scores, _, _, _, _, _, _ = self.model(x)
+                loss = self.criterion(adv_locs, adv_scores, bboxes, labels)
+                #cls_loss = nn.CrossEntropyLoss()(outputs, labels)
 
-                loss = cls_loss
                 grad_outputs = None
                 grads = torch.autograd.grad(loss, x, grad_outputs=grad_outputs,
                                             only_inputs=True)[0]

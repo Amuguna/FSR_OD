@@ -1,242 +1,181 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import time
 import torch.backends.cudnn as cudnn
-import torch.nn.functional as F
-
-import torchvision
-import torchvision.transforms as transforms
-
-from models.resnet_fsr import ResNet18_FSR
-from models.vgg_fsr import vgg16_FSR
-from models.wideresnet34_fsr import WideResNet34_FSR
-
+import torch.optim
+import torch.utils.data
+from model import SSD300, MultiBoxLoss
+from datasets import PascalVOCDataset
+from utils import *
 from attacks.pgd import PGD
 
-from tqdm.auto import tqdm
+# Data parameters
+data_folder = './'  # folder with data files
+keep_difficult = True  # use objects considered difficult to detect?
 
-import argparse
-import os
+# Model parameters
+# Not too many here since the SSD300 has a very specific structure
+n_classes = len(label_map)  # number of different types of objects
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Learning parameters
+checkpoint = None  # path to model checkpoint, None if none
+batch_size = 8  # batch size
+iterations = 120000  # number of iterations to train
+workers = 4  # number of workers for loading data in the DataLoader
+print_freq = 200  # print training status every __ batches
+lr = 1e-3  # learning rate
+decay_lr_at = [80000, 100000]  # decay learning rate after these many iterations
+decay_lr_to = 0.1  # decay learning rate to this fraction of the existing learning rate
+momentum = 0.9  # momentum
+weight_decay = 5e-4  # weight decay
+grad_clip = None  # clip if gradients are exploding, which may happen at larger batch sizes (sometimes at 32) - you will recognize it by a sorting error in the MuliBox loss calculation
 
-def boolean_string(s):
-    if s not in {'False', 'True'}:
-        raise ValueError('Not a valid boolean string')
-    return s == 'True'
-
-
-parser = argparse.ArgumentParser(description='FSR Training')
-parser.add_argument('--save_name', type=str, help='specify checkpoint save name')
-parser.add_argument('--lam_sep', type=float, default=1.0, help='weight for separation loss')
-parser.add_argument('--lam_rec', type=float, default=1.0, help='weight for recalibration loss')
-parser.add_argument('--lr', default=0.1, type=float, help='learning rate for classifier')
-parser.add_argument('--bs', default=128, type=int, help='batch size')
-parser.add_argument('--epoch', default=100, type=int, help='number of epochs')
-parser.add_argument('--dataset', type=str, default='cifar10', help='target dataset')
-parser.add_argument('--model', type=str, default='resnet18', help='model name')
-parser.add_argument('--eps', type=float, default=8., help='perturbation constraint epsilon')
-parser.add_argument('--alpha', type=float, default=0.25, help='step size alpha')
-parser.add_argument('--tau', type=float, default=0.1, help='tau for Gumbel softmax')
-parser.add_argument('--device', type=int, help='device id')
-args = parser.parse_args()
-
-print(args)
-
-device = 'cuda:{}'.format(args.device) if torch.cuda.is_available() else 'cpu'
-start_epoch = 1
-
-if args.dataset == 'cifar10':
-    num_classes = 10
-    image_size = (32, 32)
-    transform_train = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: F.pad(x.unsqueeze(0),
-                                          (4, 4, 4, 4), mode='constant', value=0).squeeze()),
-        transforms.ToPILImage(),
-        transforms.RandomCrop(32),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-
-    trainset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=transform_train)
-    trainloader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.bs, shuffle=True)
-
-    testset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=transform_test)
-    testloader = torch.utils.data.DataLoader(
-        testset, batch_size=args.bs, shuffle=False)
-
-elif args.dataset == 'svhn':
-    num_classes = 10
-    image_size = (32, 32)
-    transform_train = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-
-    trainset = torchvision.datasets.SVHN(
-        root='./data', split='train', download=True, transform=transform_train)
-    trainloader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.bs, shuffle=True)
-
-    testset = torchvision.datasets.SVHN(
-        root='./data', split='test', download=True, transform=transform_test)
-    testloader = torch.utils.data.DataLoader(
-        testset, batch_size=args.bs, shuffle=False)
-
-models = {
-    'resnet18': ResNet18_FSR(tau=args.tau, num_classes=num_classes, image_size=image_size),
-    'vgg16': vgg16_FSR(tau=args.tau, num_classes=num_classes, image_size=image_size),
-    'wideresnet34': WideResNet34_FSR(tau=args.tau, num_classes=num_classes, image_size=image_size),
-}
-
-model_name = args.model
-net = models[model_name]
-net = net.to(device)
 cudnn.benchmark = True
 
 
-criterion = nn.CrossEntropyLoss(reduction='mean')
-optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+def main():
+    """
+    Training.
+    """
+    global start_epoch, label_map, epoch, checkpoint, decay_lr_at
+
+    # Initialize model or load checkpoint
+    if checkpoint is None:
+        start_epoch = 0
+        model = SSD300(n_classes=n_classes)
+        # Initialize the optimizer, with twice the default learning rate for biases, as in the original Caffe repo
+        biases = list()
+        not_biases = list()
+        for param_name, param in model.named_parameters():
+            if param.requires_grad:
+                if param_name.endswith('.bias'):
+                    biases.append(param)
+                else:
+                    not_biases.append(param)
+        optimizer = torch.optim.SGD(params=[{'params': biases, 'lr': 2 * lr}, {'params': not_biases}],
+                                    lr=lr, momentum=momentum, weight_decay=weight_decay)
+
+    else:
+        checkpoint = torch.load(checkpoint)
+        start_epoch = checkpoint['epoch'] + 1
+        print('\nLoaded checkpoint from epoch %d.\n' % start_epoch)
+        model = checkpoint['model']
+        optimizer = checkpoint['optimizer']
+
+    # Move to default device
+    model = model.to(device)
+    eps = 8
+    alpha = 0.25
+    attack = PGD(model, eps/255.0, alpha * (eps/255.0), min_val=0, max_val=1, max_iters=10, _type='linf')
+    criterion = MultiBoxLoss(priors_cxcy=model.priors_cxcy).to(device)
+
+    # Custom dataloaders
+    train_dataset = PascalVOCDataset(data_folder,
+                                     split='train',
+                                     keep_difficult=keep_difficult)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                               collate_fn=train_dataset.collate_fn, num_workers=workers,
+                                               pin_memory=True)  # note that we're passing the collate function here
+
+    # Calculate total number of epochs to train and the epochs to decay learning rate at (i.e. convert iterations to epochs)
+    # To convert iterations to epochs, divide iterations by the number of iterations per epoch
+    # The paper trains for 120,000 iterations with a batch size of 32, decays after 80,000 and 100,000 iterations
+    epochs = iterations // (len(train_dataset) // 32)
+    decay_lr_at = [it // (len(train_dataset) // 32) for it in decay_lr_at]
+
+    # Epochs
+    for epoch in range(start_epoch, epochs):
+
+        # Decay learning rate at particular epochs
+        if epoch in decay_lr_at:
+            adjust_learning_rate(optimizer, decay_lr_to)
+
+        # One epoch's training
+        train(train_loader=train_loader,
+              model=model,
+              attack=attack,
+              criterion=criterion,
+              optimizer=optimizer,
+              epoch=epoch)
+
+        # Save checkpoint
+        save_checkpoint(epoch, model, optimizer)
 
 
-def get_pred(out, labels):
-    pred = out.sort(dim=-1, descending=True)[1][:, 0]
-    second_pred = out.sort(dim=-1, descending=True)[1][:, 1]
-    adv_label = torch.where(pred == labels, second_pred, pred)
+def train(train_loader, model, attack, criterion, optimizer, epoch):
+    """
+    One epoch's training.
 
-    return adv_label
+    :param train_loader: DataLoader for training data
+    :param model: model
+    :param criterion: MultiBox loss
+    :param optimizer: optimizer
+    :param epoch: epoch number
+    """
+     # training mode enables dropout
 
+    batch_time = AverageMeter()  # forward prop. + back prop. time
+    data_time = AverageMeter()  # data loading time
+    losses = AverageMeter()  # loss
 
-attack = PGD(net, args.eps/255.0, args.alpha * (args.eps/255.0), min_val=0, max_val=1, max_iters=10, _type='linf')
+    start = time.time()
 
-
-def adjust_learning_rate(optimizer, epoch):
-    """decrease the learning rate"""
-    lr = args.lr
-    if epoch >= 75:
-        lr = args.lr * 0.1
-    if epoch >= 90:
-        lr = args.lr * 0.01
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-# Training
-def train(epoch):
-    print('\nEpoch: %d' % epoch)
-    net.train()
-    adv_cls_losses = 0
+    adv_losses = 0
     sep_losses = 0
     rec_losses = 0
-    adv_correct = 0
-    total = 0
 
-    adjust_learning_rate(optimizer, epoch)
+    # Batches
+    for i, (images, boxes, labels, _) in enumerate(train_loader):
+        data_time.update(time.time() - start)
 
-    with tqdm(total=(len(trainset) - len(trainset) % args.bs)) as _tqdm:
-        _tqdm.set_description('{} (Train) Epoch: {}/{}'.format(args.save_name, epoch, args.epoch))
-        for batch_idx, (inputs, targets) in enumerate(trainloader):
-            inputs, targets = inputs.to(device), targets.to(device)
+        # Move to default device
+        images = images.to(device)  # (batch_size (N), 3, 300, 300)
+        boxes = [b.to(device) for b in boxes]
+        labels = [l.to(device) for l in labels]
 
-            net.eval()
-            adv_inputs = attack.perturb(inputs, targets, True)
-            net.train()
+        model.eval()
+        adv_images = attack.perturb(images, boxes, labels, True)
+        model.train() 
+        
+        # Forward prop.
+        # locs: (N, 8732, 4), scores: (N, 8732, n_classes)
+        adv_predicted_locs, adv_predicted_scores, r_predicted_locs, r_predicted_scores, nr_predicted_locs, nr_predicted_scores, rec_predcited_locs, rec_predcited_scores = model(adv_images) 
+        
+        # Loss
+        adv_losses = criterion(adv_predicted_locs, adv_predicted_scores, boxes, labels)  # scalar
+        r_losses = criterion(r_predicted_locs, r_predicted_scores, boxes, labels)
+        nr_losses = criterion(nr_predicted_locs, nr_predicted_scores, boxes, labels)
+        sep_losses = r_losses + nr_losses
+        rec_losses = criterion(rec_predcited_locs, rec_predcited_scores, boxes, labels)
+        loss = adv_losses + sep_losses + rec_losses
+        
 
-            adv_outputs, adv_r_outputs, adv_nr_outputs, adv_rec_outputs = net(adv_inputs)
-            adv_labels = get_pred(adv_outputs, targets)
+        # Backward prop.
+        optimizer.zero_grad()
+        loss.backward()
 
-            adv_cls_loss = criterion(adv_outputs, targets)
-            
-            r_loss = torch.tensor(0.).to(device)
-            if not len(adv_r_outputs) == 0:
-                for r_out in adv_r_outputs:
-                    r_loss += args.lam_sep * criterion(r_out, targets)
-                r_loss /= len(adv_r_outputs)
+        # Clip gradients, if necessary
+        if grad_clip is not None:
+            clip_gradient(optimizer, grad_clip)
 
-            nr_loss = torch.tensor(0.).to(device)
-            if not len(adv_nr_outputs) == 0:
-                for nr_out in adv_nr_outputs:
-                    nr_loss += args.lam_sep * criterion(nr_out, adv_labels)
-                nr_loss /= len(adv_nr_outputs)
-            sep_loss = r_loss + nr_loss
+        # Update model
+        optimizer.step()
 
-            rec_loss = torch.tensor(0.).to(device)
-            if not len(adv_rec_outputs) == 0:
-                for rec_out in adv_rec_outputs:
-                    rec_loss += args.lam_rec * criterion(rec_out, targets)
-                rec_loss /= len(adv_rec_outputs)
+        losses.update(loss.item(), images.size(0))
+        batch_time.update(time.time() - start)
 
-            loss = adv_cls_loss + sep_loss + rec_loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        start = time.time()
 
-            adv_cls_losses += adv_cls_loss.item()
-            sep_losses += sep_loss.item()
-            rec_losses += rec_loss.item()
-            _, adv_predicted = adv_outputs.max(1)
-            total += targets.size(0)
-            adv_correct += adv_predicted.eq(targets).sum().item()
-
-            _tqdm.set_postfix(
-                Adv_Loss='{:.3f}'.format(adv_cls_losses / (batch_idx + 1)),
-                Sep_Loss='{:.3f}'.format(sep_losses / (batch_idx + 1)),
-                Rec_Loss='{:.3f}'.format(rec_losses / (batch_idx + 1)),
-                Adv_Acc='{:.3f}%'.format(100. * adv_correct / total),
-            )
-            _tqdm.update(inputs.shape[0])
+        # Print status
+        if i % print_freq == 0:
+            print(adv_losses, r_losses, nr_losses, rec_losses)
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Batch Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data Time {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(epoch, i, len(train_loader),
+                                                                  batch_time=batch_time,
+                                                                  data_time=data_time, loss=losses))
+    del adv_predicted_locs, adv_predicted_scores, images, boxes, labels  # free some memory since their histories may be stored
 
 
-def test(epoch):
-    net.eval()
-    ori_test_loss = 0
-    adv_test_loss = 0
-    ori_correct = 0
-    adv_correct = 0
-    total = 0
-    with tqdm(total=(len(testset) - len(testset) % args.bs), dynamic_ncols=True) as _tqdm:
-        _tqdm.set_description('{} (Test) Epoch: {}/{}'.format(args.save_name, epoch, args.epoch))
-        for batch_idx, (inputs, targets) in enumerate(testloader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            adv_inputs = attack.perturb(inputs, targets, False)
-            net.eval()
-
-            ori_outputs, ori_r_outputs, ori_nr_outputs, ori_rec_outputs = net(inputs, is_eval=True)
-            adv_outputs, adv_r_outputs, adv_nr_outputs, adv_rec_outputs = net(adv_inputs, is_eval=True)
-
-            ori_loss = criterion(ori_outputs, targets)
-            ori_test_loss += ori_loss.item()
-            _, ori_predicted = ori_outputs.max(1)
-            ori_correct += ori_predicted.eq(targets).sum().item()
-
-            adv_loss = criterion(adv_outputs, targets)
-            adv_test_loss += adv_loss.item()
-            _, adv_predicted = adv_outputs.max(1)
-            adv_correct += adv_predicted.eq(targets).sum().item()
-
-            total += targets.size(0)
-
-            _tqdm.set_postfix(
-                Ori_Loss='{:.3f}'.format(ori_test_loss/(batch_idx+1)),
-                Ori_Acc='{:.3f}%'.format(100.*ori_correct/total),
-                Adv_Loss='{:.3f}'.format(adv_test_loss/(batch_idx+1)),
-                Adv_Acc='{:.3f}%'.format(100.*adv_correct/total),
-            )
-            _tqdm.update(inputs.shape[0])
-
-    if not os.path.exists('./weights/{}/{}/'.format(args.dataset, args.model)):
-        os.makedirs('./weights/{}/{}/'.format(args.dataset, args.model))
-    torch.save(net.state_dict(), './weights/{}/{}/{}.pth'.format(args.dataset, args.model, args.save_name))
-
-
-for epoch in range(start_epoch, args.epoch + 1):
-    train(epoch)
-    test(epoch)
+if __name__ == '__main__':
+    main()
